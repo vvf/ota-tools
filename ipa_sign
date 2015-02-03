@@ -7,7 +7,8 @@ if [[ "$1" == '-i' ]]; then
 fi
 
 if [[ "$1" == '-l' ]]; then
-    security find-certificate -a | awk '/^keychain/ {if(k!=$0){print; k=$0;}} /"labl"<blob>=/{sub(".*<blob>=","          "); print}'
+#    security find-certificate -a | awk '/^keychain/ {if(k!=$0){print; k=$0;}} /"labl"<blob>=/{sub(".*<blob>=","          "); print}'
+    security find-identity -p codesigning -v | grep -v 'valid identities found' | sed -E 's/.*"([^"]+)".*/\1/'
     exit
 fi
 
@@ -29,9 +30,9 @@ if [[ ! ( # any of the following are not true
     Usage: $(basename "$0") -i Application.ipa
 
     Options:
-      -i    Only inspect the package. Do not resign it.
       -l    List certificates and exit
 EOF
+
     exit;
 fi
 
@@ -45,28 +46,60 @@ set -o errexit
 realpath(){
     echo "$(cd "$(dirname "$1")"; echo -n "$(pwd)/$(basename "$1")")";
 }
-
+#"
 IPA="$(realpath $1)"
 PROVISION="$(realpath "$2")"
-TMP="$(mktemp -d /tmp/resign.$(basename "$IPA" .ipa).XXXXX)"
-IPA_NEW="$(pwd)/$(basename "$IPA" .ipa).resigned.ipa"
+TMP="$(mktemp -d /tmp/resign.$(basename "$IPA" .ipa).XXXXXXX)"
+RNDNAME=${TMP/*./}
+IPA_NEW="$(pwd)/$(basename "$IPA" .ipa).theuxru.ipa"
 CLEANUP_TEMP=0 # Do not remove this line or "set -o nounset" will error on checks below
 #CLEANUP_TEMP=1 # Uncomment this line if you want this script to clean up after itself
 cd "$TMP"
 [[ $CLEANUP_TEMP -ne 1 ]] && echo "Using temp dir: $TMP"
 unzip -q "$IPA"
 plutil -convert xml1 Payload/*.app/Info.plist -o Info.plist
+bundlid=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' Info.plist)
 echo "App has BundleDisplayName '$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' Info.plist)' and BundleShortVersionString '$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)'"
-echo "App has BundleIdentifier  '$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' Info.plist)' and BundleVersion $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Info.plist)"
-security cms -D -i Payload/*.app/embedded.mobileprovision > mobileprovision.plist
+echo "App has BundleIdentifier  '$bundlid' and BundleVersion $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Info.plist)" #"
+[ -e Payload/*.app/embedded.mobileprovision ] && security cms -D -i Payload/*.app/embedded.mobileprovision > mobileprovision.plist
+security cms -D -i "$PROVISION" > new_mobileprovision.plist
+
 echo "App has provision         '$(/usr/libexec/PlistBuddy -c "Print :Name" mobileprovision.plist)', which supports '$(/usr/libexec/PlistBuddy -c "Print :Entitlements:application-identifier" mobileprovision.plist)'"
+appid=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:application-identifier" new_mobileprovision.plist)
+if echo $appid | grep '.\*'; then
+    appid=${appid/.\*/\.}$RNDNAME
+    bunid=$(echo $appid | sed -E 's/[^.]+\.//')
+fi
+echo "########### new appId is $appid"
+echo "########### new bundleId is $bunid"
+sed -i ""  "s/$bundlid/$bunid/" Info.plist
+#   make binary plist in payload
+plutil -convert binary1 Info.plist -o Payload/*.app/Info.plist
+sed  "s/__APPID__/$appid/" > archived-expanded-entitlements.xcent << ENTITL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>application-identifier</key>
+	<string>__APPID__</string>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>__APPID__</string>
+	</array>
+</dict>
+</plist>
+ENTITL
+cp archived-expanded-entitlements.xcent Payload/*.app/
+
 if [[ ! ($INSPECT_ONLY == 1) ]]; then
     CERTIFICATE="$3"
     security cms -D -i "$PROVISION" > provision.plist
     echo "Embedding provision       '$(/usr/libexec/PlistBuddy -c "Print :Name" provision.plist)', which supports '$(/usr/libexec/PlistBuddy -c "Print :Entitlements:application-identifier" provision.plist)'"
     rm -rf Payload/*.app/_CodeSignature Payload/*.app/CodeResources
-    cp "$PROVISION" Payload/*.app/embedded.mobileprovision
-    /usr/bin/codesign -f -s "$CERTIFICATE" --resource-rules Payload/*.app/ResourceRules.plist Payload/*.app
+    echo cp "$PROVISION" "`echo Payload/*.app/`embedded.mobileprovision"
+    cp "$PROVISION" "`echo Payload/*.app/`embedded.mobileprovision"
+    /usr/bin/codesign  -f -s "$CERTIFICATE" --en archived-expanded-entitlements.xcent Payload/*.app
+#    /usr/bin/codesign  -f -s "$CERTIFICATE" Payload/*.app
     zip -qr "$IPA_NEW" Payload
 fi
 [[ $CLEANUP_TEMP -eq 1 ]] && rm -rf "$TMP"
